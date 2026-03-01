@@ -3,17 +3,26 @@ import pandas as pd
 import gspread
 from datetime import datetime
 
-# --- 1. 보안 및 데이터 호출 엔진 (로컬/클라우드 겸용) ---
+# --- 1. 보안 및 데이터 호출 엔진 (PEM 오류 자동 수정 로직 포함) ---
 @st.cache_resource
 def get_gc():
     try:
-        # 클라우드 배포 시 Secrets 사용, 로컬 환경은 기존 파일 사용
+        # 1. Streamlit Cloud Secrets 확인
         if "gcp_service_account" in st.secrets:
-            return gspread.service_account_from_dict(st.secrets["gcp_service_account"])
+            credentials_info = dict(st.secrets["gcp_service_account"])
+            
+            # [핵심] PEM 파일 인증 오류 방지를 위해 \n 문자열을 실제 줄바꿈으로 변환
+            if "private_key" in credentials_info:
+                credentials_info["private_key"] = credentials_info["private_key"].replace("\\n", "\n")
+            
+            return gspread.service_account_from_dict(credentials_info)
+        
+        # 2. 로컬 환경용 (credentials.json 파일 사용)
         else:
             return gspread.service_account(filename='credentials.json')
+            
     except Exception as e:
-        st.error(f"인증 오류: {e}")
+        st.error(f"⚠️ 인증 엔진 가동 실패: {e}")
         return None
 
 def fetch_museum_data(sheet_key, tab_name):
@@ -23,15 +32,16 @@ def fetch_museum_data(sheet_key, tab_name):
         spreadsheet = gc.open_by_key(sheet_key)
         sheet = spreadsheet.worksheet(tab_name)
         raw_data = sheet.get_all_values()
-        if not raw_data: return pd.DataFrame(), spreadsheet
-        # 1행을 헤더로 설정
+        if not raw_data or len(raw_data) < 2: return pd.DataFrame(), spreadsheet
+        
+        # 1행 헤더 기준 데이터프레임 생성
         df = pd.DataFrame(raw_data[1:], columns=raw_data[0])
         return df, spreadsheet
     except Exception as e:
-        st.error(f"시트 로드 오류: {e}")
+        st.error(f"❌ 시트 데이터 로드 실패: {e}")
         return pd.DataFrame(), None
 
-# --- 2. 대분류 명칭 정규화 엔진 (J열 통합) ---
+# --- 2. 대분류 명칭 정규화 (J열 통합) ---
 def normalize_j(name):
     name = str(name).replace(" ", "")
     if '세그니' in name: return '세그니모시展: Move & Draw'
@@ -42,7 +52,7 @@ def normalize_j(name):
 st.set_page_config(page_title="1101 MUSEUM 통합 OS", layout="wide")
 st.title("📊 1101 MUSEUM 이용완료 매출/인원 현황")
 
-# 구글 시트 정보 설정
+# 구글 시트 정보 (BIN님의 시트 ID)
 SHEET_KEY = "1QKH40pM5BIK1q8cy0pgUrRhnVJTyZo5WpImpqgkozbw"
 ORIGINAL_TAB = "완료"
 TARGET_TAB = "시트2"
@@ -51,7 +61,7 @@ try:
     df_raw, spreadsheet = fetch_museum_data(SHEET_KEY, ORIGINAL_TAB)
     
     if not df_raw.empty:
-        # [데이터 매핑] A:상태, J:대분류(9), N:소분류(13), O:금액(14), Z:날짜(25)
+        # [열 매핑] A:상태(0), J:대분류(9), N:소분류(13), O:금액(14), Z:날짜(25)
         cols = df_raw.columns.tolist()
         col_a, col_j, col_n, col_o, col_z = cols[0], cols[9], cols[13], cols[14], cols[25]
 
@@ -88,21 +98,20 @@ try:
 
         st.divider()
 
-        # 대분류별 상세 내역 (합계 포함)
+        # 대분류별 상세 내역 및 합계 표시
         if not summary.empty:
             for main_cat in summary['대분류(J)'].unique():
                 cat_df = summary[summary['대분류(J)'] == main_cat]
                 cat_sum, cat_ppl = cat_df['매출합계(O)'].sum(), cat_df['인원수(행)'].sum()
                 
-                # 헤더에 대분류 전체 합계 표시
                 header_text = f"📌 {main_cat} — [ 총 매출: {cat_sum:,.0f}원 | 총 인원: {cat_ppl:,.0f}명 ]"
                 with st.expander(header_text, expanded=True):
                     st.table(cat_df[['소분류(N)', '매출합계(O)', '인원수(행)']])
             
             # --- 시트2 데이터 자동 기록 기능 ---
             st.divider()
-            st.subheader("📁 보고서 저장")
-            if st.button("💾 현재 분석 결과를 '시트2'에 기록하기"):
+            st.subheader("📁 분석 보고서 저장")
+            if st.button("💾 현재 분석 결과를 '시트2'에 실시간 기록하기"):
                 try:
                     try: target_sheet = spreadsheet.worksheet(TARGET_TAB)
                     except: target_sheet = spreadsheet.add_worksheet(title=TARGET_TAB, rows="100", cols="20")
@@ -111,11 +120,11 @@ try:
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     header_info = [["분석 실행 시간", timestamp], ["분석 모드", view_mode], [], summary.columns.tolist()]
                     target_sheet.update('A1', header_info + summary.values.tolist())
-                    st.success(f"✅ '{TARGET_TAB}' 시트에 저장이 완료되었습니다!")
+                    st.success(f"✅ 구글 시트 '{TARGET_TAB}' 탭에 저장이 완료되었습니다!")
                 except Exception as ex:
                     st.error(f"시트 기록 오류: {ex}")
         else:
-            st.info("해당 기간에 '이용완료'된 데이터가 없습니다.")
+            st.info("조회된 기간에 '이용완료' 데이터가 없습니다.")
 
 except Exception as e:
     st.error(f"시스템 오류 발생: {e}")
